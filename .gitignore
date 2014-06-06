@@ -1,0 +1,4 @@
+.*.swp
+dson_tokenizer.c
+dson_parser.c
+test

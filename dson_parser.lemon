@@ -1,0 +1,167 @@
+%token_prefix DSON_
+%token_type {dson_token}
+%default_type {dson_value*}
+%extra_argument {dson_value** retval}
+%name dson_parser
+%start_symbol dson_string
+%right SO SUCH.
+%left MANY WOW.
+
+%include {
+#include "dson_tokenizer.h"
+#include "dson.h"
+#include <math.h>
+#include <string.h>
+#include <stdlib.h>
+#include <assert.h>
+
+static void dson_null(dson_value** dest) {
+	*dest = (dson_value*)malloc(sizeof(dson_value));
+	(*dest)->type = DSON_NULL;
+}
+
+static void dson_bool(dson_value** dest, char bval) {
+	*dest = (dson_value*)malloc(sizeof(dson_value));
+	(*dest)->type = DSON_BOOL;
+	(*dest)->bval = bval;
+}
+
+static void dson_long(dson_value** dest, dson_token* token) {
+	long ret = 0;
+	const unsigned char *p = token->token;
+	const unsigned char *e = p + token->token_len;
+
+	if (*p == '+') ++p;
+	if (*p == '-') ++p;
+	while (p < e) {
+		ret = (ret << 3) | (*(p++) - '0');
+	}
+	if (token->token[0] == '-') { ret = -ret; }
+	*dest = (dson_value*)malloc(sizeof(dson_value));
+	(*dest)->type = DSON_LONG;
+	(*dest)->lval = ret;
+}
+
+static void dson_double(dson_value** dest, dson_token* token, dson_token *very) {
+	double ret = 0;
+	const unsigned char *p = token->token;
+	const unsigned char *e = p + token->token_len;
+
+	while ((p < e) && (*p != '.')) {
+		ret = (ret * 8) + (*(p++) - '0');
+	}
+	if (*p == '.') {
+		double divisor = 8;
+		++p;
+		while (p < e) {
+			ret = ret + ((double)(*(p++) - '0') / divisor);
+			divisor = divisor * 8;
+		}
+	}
+
+	if (very) {
+		double exp = 1;
+		dson_long(dest, very);
+		exp = pow(8.0, (*dest)->lval);
+		if (exp < 0) {
+			ret = ret / (-exp);
+		} else {
+			ret = ret * exp;
+		}
+	} else {
+		*dest = (dson_value*)malloc(sizeof(dson_value));
+	}
+	(*dest)->type = DSON_DOUBLE;
+	(*dest)->dval = ret;
+}
+
+static void dson_string(dson_value** dest, dson_token* token) {
+	*dest = (dson_value*)malloc(sizeof(dson_value));
+	(*dest)->type = DSON_STRING;
+	(*dest)->strval = strndup((const char*)token->token, token->token_len);
+	(*dest)->len = token->token_len;
+}
+
+
+#define DSON_ARRAY_ALLOC_CHUNKSIZE 8
+static void dson_array(dson_value** dest, dson_value* arr, dson_value* val) {
+	if (!arr) {
+		arr = (dson_value*)malloc(sizeof(dson_value));
+		arr->type = DSON_ARRAY;
+		arr->arrval = NULL;
+		arr->len = 0;
+	}
+	*dest = arr;
+	if (!val) {
+		return;
+	}
+	if ((arr->len % DSON_ARRAY_ALLOC_CHUNKSIZE) == 0) {
+		int maxlen = arr->len + DSON_ARRAY_ALLOC_CHUNKSIZE;
+		arr->arrval = (dson_value**)realloc(arr->arrval,
+		                                    sizeof(dson_value*)*maxlen);
+	}
+	arr->arrval[arr->len++] = val;
+}
+
+#define DSON_OBJECT_ALLOC_CHUNKSIZE 8
+static void dson_object(dson_value** dest, dson_value* obj, dson_token *key, dson_value* val) {
+	if (!obj) {
+		obj = (dson_value*)malloc(sizeof(dson_value));
+		obj->type = DSON_OBJECT;
+		obj->objval = NULL;
+		obj->len = 0;
+	}
+	*dest = obj;
+	if (!val) {
+		return;
+	}
+	if ((obj->len % DSON_OBJECT_ALLOC_CHUNKSIZE) == 0) {
+		int maxlen = obj->len + DSON_OBJECT_ALLOC_CHUNKSIZE;
+		obj->objval = (dson_pair**)realloc(obj->objval,
+		                                   sizeof(dson_pair*)*maxlen);
+	}
+	{
+		dson_pair *p = (dson_pair*)malloc(sizeof(dson_pair));
+		p->key = strndup((const char*)key->token, key->token_len);
+		p->value = val;
+		obj->objval[obj->len++] = p;
+	}
+}
+
+} /* %include */
+%syntax_error {
+	fprintf(stderr, "syntax error");
+}
+%parse_failure {
+	fprintf(stderr, "parse error");
+}
+%token_destructor {
+	if ($$.freeme) {
+		free($$.token);
+	}
+}
+
+dson_string ::= dson_value(V). { *retval = V; }
+
+%destructor dson_value { dson_free_value($$); }
+dson_value(V) ::= EMPTY. { dson_null(&V); }
+dson_value(V) ::= YES.   { dson_bool(&V, 1); }
+dson_value(V) ::= NO.    { dson_bool(&V, 0); }
+
+dson_value(V) ::= LNUM(N).  { dson_long(&V, &N); }
+dson_value(V) ::= DNUM(N).  { dson_double(&V, &N, NULL); }
+dson_value(V) ::= DNUM(N) VERY LNUM(E). { dson_double(&V, &N, &E); }
+dson_value(V) ::= STR(S).   { dson_string(&V, &S); }
+
+dson_value(V) ::= SO dson_array_list(L) MANY. { V = L; }
+dson_value(V) ::= SUCH dson_object_list(L) WOW. { V = L; }
+
+%destructor dson_array_list { dson_free_value($$); }
+dson_array_list(A) ::= . { dson_array(&A, NULL, NULL); }
+dson_array_list(A) ::= dson_value(V). { dson_array(&A, NULL, V); }
+dson_array_list(A) ::= dson_array_list(L) ALSO dson_value(V). { dson_array(&A, L, V); }
+
+%destructor dson_object_list { dson_free_value($$); }
+dson_object_list(O) ::= . { dson_object(&O, NULL, NULL, NULL); }
+dson_object_list(O) ::= STR(S) IS dson_value(V). { dson_object(&O, NULL, &S, V); }
+dson_object_list(O) ::= dson_object_list(L) COMMA STR(S) IS dson_value(V). { dson_object(&O, L, &S, V); }
